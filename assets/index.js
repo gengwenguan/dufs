@@ -160,6 +160,8 @@ async function ready() {
 
     await setupEditorPage();
   }
+
+  setupClipboard();
 }
 
 class Uploader {
@@ -579,6 +581,117 @@ function setupDownloadWithToken() {
       }
     });
   });
+}
+
+function setupClipboard() {
+  const $btn = document.querySelector(".clipboard-btn");
+  const $badge = document.querySelector(".clipboard-badge");
+  const $panel = document.querySelector(".clipboard-panel");
+  const $close = document.querySelector(".clipboard-close");
+  const $textarea = document.querySelector(".clipboard-textarea");
+  const $meta = document.querySelector(".clipboard-meta");
+  const $status = document.querySelector(".clipboard-status");
+  const $copy = document.querySelector(".clipboard-copy");
+  const $save = document.querySelector(".clipboard-save");
+
+  const url = clipboardUrl();
+  // Only users with write permission can push updates.
+  const canWrite = DATA.allow_upload || DATA.allow_delete;
+
+  // Whether the local textarea has unsaved edits, used to avoid clobbering
+  // remote updates while the user is typing.
+  let dirty = false;
+
+  $btn.classList.remove("hidden");
+  if (canWrite) $save.classList.remove("hidden");
+
+  $btn.addEventListener("click", () => {
+    $panel.classList.toggle("hidden");
+    if (!$panel.classList.contains("hidden")) {
+      $badge.classList.add("hidden");
+      $textarea.focus();
+    }
+  });
+  $close.addEventListener("click", () => $panel.classList.add("hidden"));
+
+  $textarea.addEventListener("input", () => { dirty = true; });
+  $textarea.readOnly = !canWrite;
+
+  $copy.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText($textarea.value);
+      flash($copy, "Copied!");
+    } catch {
+      $textarea.select();
+      flash($copy, "Select + Ctrl/Cmd+C");
+    }
+  });
+
+  $save.addEventListener("click", async () => {
+    try {
+      const res = await fetch(url, { method: "PUT", body: $textarea.value });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      dirty = false;
+      flash($save, "Saved!");
+    } catch (err) {
+      flash($save, "Failed");
+      alert(`Failed to save clipboard, ${err.message}`);
+    }
+  });
+
+  function applyState(state) {
+    if (typeof state.version !== "number") return;
+    // Don't overwrite the user's in-progress edits.
+    if (!dirty || $textarea.value === state.content) {
+      $textarea.value = state.content;
+      dirty = false;
+      renderMeta(state);
+    } else {
+      $meta.textContent = "Remote content updated. Save to overwrite, or reopen to discard.";
+    }
+    if ($panel.classList.contains("hidden") && state.version > 0) {
+      $badge.classList.remove("hidden");
+    }
+  }
+
+  function renderMeta(state) {
+    if (state.version === 0) {
+      $meta.textContent = "Clipboard is empty.";
+      return;
+    }
+    const who = state.user ? state.user : "anonymous";
+    const when = state.mtime ? new Date(state.mtime).toLocaleString() : "";
+    $meta.textContent = `Last updated by ${who}${when ? " · " + when : ""}`;
+  }
+
+  function setStatus(text, color) {
+    $status.textContent = text;
+    $status.style.color = color;
+  }
+
+  function flash($el, text) {
+    const original = $el.textContent;
+    $el.textContent = text;
+    setTimeout(() => { $el.textContent = original; }, 1500);
+  }
+
+  // Live updates via Server-Sent Events, with EventSource's built-in reconnect.
+  setStatus("connecting…", "");
+  const es = new EventSource(url + "/events");
+  es.addEventListener("open", () => setStatus("● synced", "#3fb950"));
+  es.addEventListener("message", e => {
+    try {
+      applyState(JSON.parse(e.data));
+      setStatus("● synced", "#3fb950");
+    } catch { }
+  });
+  es.addEventListener("error", () => setStatus("● reconnecting…", "#d29922"));
+}
+
+function clipboardUrl() {
+  let prefix = DATA.uri_prefix || "/";
+  if (!prefix.endsWith("/")) prefix += "/";
+  return location.origin + prefix + "__dufs__/clipboard";
 }
 
 function setupSearch() {

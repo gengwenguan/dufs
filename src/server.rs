@@ -3,7 +3,9 @@
 use crate::auth::{www_authenticate, AccessPaths, AccessPerm};
 use crate::http_utils::{body_full, IncomingStream, LengthLimitedStream};
 use crate::noscript::{detect_noscript, generate_noscript_html};
-use crate::utils::{decode_uri, encode_uri, get_file_name, glob, parse_range, try_get_file_name};
+use crate::utils::{
+    decode_uri, encode_uri, get_file_name, glob, parse_range, try_get_file_name, unix_now,
+};
 use crate::Args;
 
 use anyhow::{anyhow, Result};
@@ -17,7 +19,7 @@ use headers::{
     ContentLength, ContentType, ETag, HeaderMap, HeaderMapExt, IfMatch, IfModifiedSince,
     IfNoneMatch, IfRange, IfUnmodifiedSince, LastModified, Range,
 };
-use http_body_util::{combinators::BoxBody, BodyExt, StreamBody};
+use http_body_util::{combinators::BoxBody, BodyExt, Limited, StreamBody};
 use hyper::body::Frame;
 use hyper::{
     body::Incoming,
@@ -41,6 +43,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite};
+use tokio::sync::{broadcast, RwLock};
 use tokio::{fs, io};
 
 use tokio_util::io::{ReaderStream, StreamReader};
@@ -60,7 +63,33 @@ const BUF_SIZE: usize = 65536;
 const EDITABLE_TEXT_MAX_SIZE: u64 = 4194304; // 4M
 const RESUMABLE_UPLOAD_MIN_SIZE: u64 = 20971520; // 20M
 const HEALTH_CHECK_PATH: &str = "__dufs__/health";
+const CLIPBOARD_PATH: &str = "__dufs__/clipboard";
+const CLIPBOARD_EVENTS_PATH: &str = "__dufs__/clipboard/events";
+const CLIPBOARD_MAX_SIZE: u64 = 65536; // 64K
 pub const MAX_SUBPATHS_COUNT: u64 = 1000;
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct ClipboardState {
+    content: String,
+    version: u64,
+    mtime: u64,
+    user: Option<String>,
+}
+
+struct Clipboard {
+    state: Arc<RwLock<ClipboardState>>,
+    notifier: broadcast::Sender<u64>,
+}
+
+impl Default for Clipboard {
+    fn default() -> Self {
+        let (notifier, _) = broadcast::channel(16);
+        Self {
+            state: Arc::new(RwLock::new(ClipboardState::default())),
+            notifier,
+        }
+    }
+}
 
 pub struct Server {
     args: Args,
@@ -68,6 +97,7 @@ pub struct Server {
     html: Cow<'static, str>,
     single_file_req_paths: Vec<String>,
     running: Arc<AtomicBool>,
+    clipboard: Clipboard,
 }
 
 impl Server {
@@ -96,6 +126,7 @@ impl Server {
             single_file_req_paths,
             assets_prefix,
             html,
+            clipboard: Clipboard::default(),
         })
     }
 
@@ -227,6 +258,33 @@ impl Server {
 
         if has_query_flag(&query_params, "tokengen") {
             self.handle_tokengen(&relative_path, user, &mut res).await?;
+            return Ok(res);
+        }
+
+        if relative_path == CLIPBOARD_EVENTS_PATH {
+            if method == Method::GET {
+                self.handle_clipboard_events(&mut res)?;
+            } else {
+                *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+            }
+            return Ok(res);
+        } else if relative_path == CLIPBOARD_PATH {
+            match method {
+                Method::GET | Method::HEAD => {
+                    self.handle_clipboard_get(method == Method::HEAD, &mut res)
+                        .await?;
+                }
+                Method::PUT => {
+                    if self.args.allow_upload && access_paths.perm().readwrite() {
+                        self.handle_clipboard_set(user, req, &mut res).await?;
+                    } else {
+                        status_forbid(&mut res);
+                    }
+                }
+                _ => {
+                    *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+                }
+            }
             return Ok(res);
         }
 
@@ -1086,6 +1144,91 @@ impl Server {
         res.headers_mut()
             .typed_insert(ContentLength(output.len() as u64));
         *res.body_mut() = body_full(output);
+        Ok(())
+    }
+
+    async fn handle_clipboard_get(&self, head_only: bool, res: &mut Response) -> Result<()> {
+        let state = self.clipboard.state.read().await.clone();
+        let output = serde_json::to_string(&state)?;
+        res.headers_mut()
+            .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
+        res.headers_mut()
+            .typed_insert(ContentLength(output.len() as u64));
+        res.headers_mut()
+            .typed_insert(CacheControl::new().with_no_cache());
+        if head_only {
+            return Ok(());
+        }
+        *res.body_mut() = body_full(output);
+        Ok(())
+    }
+
+    async fn handle_clipboard_set(
+        &self,
+        user: Option<String>,
+        req: Request,
+        res: &mut Response,
+    ) -> Result<()> {
+        let body = Limited::new(req.into_body(), CLIPBOARD_MAX_SIZE as usize);
+        let content = match body.collect().await {
+            Ok(collected) => match String::from_utf8(collected.to_bytes().to_vec()) {
+                Ok(v) => v,
+                Err(_) => {
+                    status_bad_request(res, "Invalid UTF-8 content");
+                    return Ok(());
+                }
+            },
+            Err(_) => {
+                status_bad_request(res, "Content too large");
+                return Ok(());
+            }
+        };
+        let version = {
+            let mut state = self.clipboard.state.write().await;
+            state.content = content;
+            state.version += 1;
+            state.mtime = unix_now().as_millis() as u64;
+            state.user = user;
+            state.version
+        };
+        let _ = self.clipboard.notifier.send(version);
+        status_no_content(res);
+        Ok(())
+    }
+
+    fn handle_clipboard_events(&self, res: &mut Response) -> Result<()> {
+        let mut receiver = self.clipboard.notifier.subscribe();
+        let state = self.clipboard.state.clone();
+        let stream = async_stream::stream! {
+            // Push the current state immediately on connect.
+            {
+                let snapshot = state.read().await.clone();
+                if let Ok(data) = serde_json::to_string(&snapshot) {
+                    yield Ok(Frame::data(Bytes::from(format!("data: {data}\n\n"))));
+                }
+            }
+            loop {
+                match receiver.recv().await {
+                    Ok(_) => {
+                        let snapshot = state.read().await.clone();
+                        if let Ok(data) = serde_json::to_string(&snapshot) {
+                            yield Ok(Frame::data(Bytes::from(format!("data: {data}\n\n"))));
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        };
+        res.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=UTF-8"),
+        );
+        res.headers_mut()
+            .typed_insert(CacheControl::new().with_no_cache());
+        res.headers_mut()
+            .insert(CONNECTION, HeaderValue::from_static("keep-alive"));
+        *res.body_mut() = StreamBody::new(stream).boxed();
         Ok(())
     }
 
