@@ -4,6 +4,7 @@
  * @property {string} name
  * @property {number} mtime
  * @property {number} size
+ * @property {string} directory_password
  */
 
 /**
@@ -20,6 +21,8 @@
  * @property {string} user
  * @property {boolean} dir_exists
  * @property {string} editable
+ * @property {boolean} directory_auth
+ * @property {string} directory_password
  */
 
 var DUFS_MAX_UPLOADINGS = 1;
@@ -41,7 +44,9 @@ var DIR_EMPTY_NOTE;
  * @property {string} sort
  * @property {string} order
  */
-const PARAMS = Object.fromEntries(new URLSearchParams(window.location.search).entries());
+let PARAMS = Object.fromEntries(new URLSearchParams(window.location.search).entries());
+
+const DIRECTORY_PASSWORD_QUERY = "dir_password";
 
 const IFRAME_FORMATS = [
   ".pdf",
@@ -124,6 +129,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   }
 
   DATA = JSON.parse(decodeBase64($indexData.innerHTML));
+  syncDirectoryPasswordInUrl();
   DIR_EMPTY_NOTE = PARAMS.q ? 'No results' : DATA.dir_exists ? 'Empty folder' : 'Folder will be created when a file is uploaded';
 
   await ready();
@@ -161,7 +167,9 @@ async function ready() {
     await setupEditorPage();
   }
 
-  setupClipboard();
+  if (!DATA.directory_auth || DATA.user) {
+    setupClipboard();
+  }
 }
 
 class Uploader {
@@ -193,7 +201,7 @@ class Uploader {
       ${getPathSvg()}
     </td>
     <td class="path cell-name">
-      <a href="${url}">${encodedName}</a>
+      <a href="${withQuery(url, "edit")}">${encodedName}</a>
     </td>
     <td class="cell-status upload-status" id="uploadStatus${idx}"></td>
   </tr>`);
@@ -360,7 +368,7 @@ function addBreadcrumb(href, uri_prefix) {
 async function setupIndexPage() {
   if (DATA.allow_archive) {
     const $download = document.querySelector(".download");
-    $download.href = baseUrl() + "?zip";
+    $download.href = withQuery(currentUrl(), "zip");
     $download.title = "Download folder as a .zip file";
     $download.classList.add("dlwt");
     $download.classList.remove("hidden");
@@ -375,6 +383,10 @@ async function setupIndexPage() {
 
   if (DATA.auth) {
     await setupAuth();
+  }
+
+  if (DATA.directory_auth && DATA.user && DATA.directory_password) {
+    setupDirectoryPassword();
   }
 
   if (DATA.allow_search) {
@@ -457,19 +469,21 @@ function renderPathsTableBody() {
  */
 function addPath(file, index) {
   const encodedName = encodedStr(file.name);
-  let url = newUrl(file.name);
   let actionDelete = "";
   let actionDownload = "";
   let actionMove = "";
   let actionEdit = "";
   let actionView = "";
   let isDir = file.path_type.endsWith("Dir");
+  let url = newUrl(file.name, file.directory_password);
   if (isDir) {
-    url += "/";
+    const directoryUrl = new URL(url);
+    if (!directoryUrl.pathname.endsWith("/")) directoryUrl.pathname += "/";
+    url = directoryUrl.toString();
     if (DATA.allow_archive) {
       actionDownload = `
       <div class="action-btn">
-        <a class="dlwt" href="${url}?zip" title="Download folder as a .zip file" download>${ICONS.download}</a>
+        <a class="dlwt" href="${withQuery(url, "zip")}" title="Download folder as a .zip file" download>${ICONS.download}</a>
       </div>`;
     }
   } else {
@@ -478,18 +492,19 @@ function addPath(file, index) {
       <a class="dlwt" href="${url}" title="Download file" download>${ICONS.download}</a>
     </div>`;
   }
+  const filePageUrl = isDir ? url : withQuery(url, "edit");
   if (DATA.allow_delete) {
     if (DATA.allow_upload) {
       actionMove = `<div onclick="movePath(${index})" class="action-btn" id="moveBtn${index}" title="Move & Rename">${ICONS.move}</div>`;
       if (!isDir) {
-        actionEdit = `<a class="action-btn" title="Edit file" target="_blank" href="${url}?edit">${ICONS.edit}</a>`;
+        actionEdit = `<a class="action-btn" title="Edit file" target="_blank" href="${withQuery(url, "edit")}">${ICONS.edit}</a>`;
       }
     }
     actionDelete = `
     <div onclick="deletePath(${index})" class="action-btn" id="deleteBtn${index}" title="Delete">${ICONS.delete}</div>`;
   }
   if (!actionEdit && !isDir) {
-    actionView = `<a class="action-btn" title="View file" target="_blank" href="${url}?view">${ICONS.view}</a>`;
+    actionView = `<a class="action-btn" title="View file" target="_blank" href="${withQuery(url, "view")}">${ICONS.view}</a>`;
   }
   let actionCell = `
   <td class="cell-actions">
@@ -508,7 +523,7 @@ function addPath(file, index) {
     ${getPathSvg(file.path_type)}
   </td>
   <td class="path cell-name">
-    <a href="${url}" ${isDir ? "" : `target="_blank"`}>${encodedName}</a>
+    <a href="${filePageUrl}" ${isDir ? "" : `target="_blank"`}>${encodedName}</a>
   </td>
   <td class="cell-mtime">${formatMtime(file.mtime)}</td>
   <td class="cell-size">${sizeDisplay}</td>
@@ -601,6 +616,7 @@ function setupClipboard() {
   // Whether the local textarea has unsaved edits, used to avoid clobbering
   // remote updates while the user is typing.
   let dirty = false;
+  let es = null;
 
   $btn.classList.remove("hidden");
   if (canWrite) $save.classList.remove("hidden");
@@ -610,9 +626,15 @@ function setupClipboard() {
     if (!$panel.classList.contains("hidden")) {
       $badge.classList.add("hidden");
       $textarea.focus();
+      connect();
+    } else {
+      disconnect();
     }
   });
-  $close.addEventListener("click", () => $panel.classList.add("hidden"));
+  $close.addEventListener("click", () => {
+    $panel.classList.add("hidden");
+    disconnect();
+  });
 
   $textarea.addEventListener("input", () => { dirty = true; });
   $textarea.readOnly = !canWrite;
@@ -675,17 +697,33 @@ function setupClipboard() {
     setTimeout(() => { $el.textContent = original; }, 1500);
   }
 
-  // Live updates via Server-Sent Events, with EventSource's built-in reconnect.
-  setStatus("connecting…", "");
-  const es = new EventSource(url + "/events");
-  es.addEventListener("open", () => setStatus("● synced", "#3fb950"));
-  es.addEventListener("message", e => {
-    try {
-      applyState(JSON.parse(e.data));
+  // Connect only while the panel is open so normal browsing does not consume
+  // one of the browser's limited HTTP/1.1 connections.
+  function connect() {
+    if (es) return;
+    setStatus("connecting…", "");
+    es = new EventSource(url + "/events");
+    es.addEventListener("open", () => {
       setStatus("● synced", "#3fb950");
-    } catch { }
-  });
-  es.addEventListener("error", () => setStatus("● reconnecting…", "#d29922"));
+    });
+    es.addEventListener("message", e => {
+      try {
+        applyState(JSON.parse(e.data));
+        setStatus("● synced", "#3fb950");
+      } catch { }
+    });
+    es.addEventListener("error", () => {
+      setStatus("● reconnecting…", "#d29922");
+    });
+  }
+
+  function disconnect() {
+    if (!es) return;
+    es.close();
+    es = null;
+  }
+
+  window.addEventListener("pagehide", disconnect);
 }
 
 function clipboardUrl() {
@@ -701,11 +739,13 @@ function setupSearch() {
     event.preventDefault();
     const formData = new FormData($searchbar);
     const q = formData.get("q");
-    let href = baseUrl();
+    const href = new URL(currentUrl());
     if (q) {
-      href += "?q=" + q;
+      href.searchParams.set("q", q);
+    } else {
+      href.searchParams.delete("q");
     }
-    location.href = href;
+    location.href = href.toString();
   });
   if (PARAMS.q) {
     document.getElementById('search').value = PARAMS.q;
@@ -731,6 +771,26 @@ function setupNewFolder() {
   });
 }
 
+function setupDirectoryPassword() {
+  const $button = document.querySelector(".directory-password");
+  $button.classList.remove("hidden");
+  $button.addEventListener("click", async () => {
+    const password = prompt("Enter a new directory password (8-128 bytes)");
+    if (password === null) return;
+    try {
+      const res = await fetch(currentUrl(), {
+        method: "SETPASSWORD",
+        body: password,
+      });
+      await assertResOK(res);
+      DATA.directory_password = password;
+      syncDirectoryPasswordInUrl();
+    } catch (err) {
+      alert(`Cannot change directory password, ${err.message}`);
+    }
+  });
+}
+
 function setupNewFile() {
   const $newFile = document.querySelector(".new-file");
   $newFile.classList.remove("hidden");
@@ -741,7 +801,7 @@ function setupNewFile() {
 }
 
 async function setupEditorPage() {
-  const url = baseUrl();
+  const url = currentUrl();
 
   const $download = document.querySelector(".download");
   $download.classList.remove("hidden");
@@ -751,20 +811,19 @@ async function setupEditorPage() {
     const $moveFile = document.querySelector(".move-file");
     $moveFile.classList.remove("hidden");
     $moveFile.addEventListener("click", async () => {
-      const query = location.href.slice(url.length);
       const newFileUrl = await doMovePath(url);
       if (newFileUrl) {
-        location.href = newFileUrl + query;
+        location.href = withQuery(newFileUrl, DATA.kind.toLowerCase());
       }
     });
 
     const $deleteFile = document.querySelector(".delete-file");
     $deleteFile.classList.remove("hidden");
     $deleteFile.addEventListener("click", async () => {
-      const url = baseUrl();
+      const url = currentUrl();
       const name = baseName(url);
       await doDeletePath(name, url, () => {
-        location.href = location.href.split("/").slice(0, -1).join("/");
+        location.href = parentUrl(url);
       });
     });
 
@@ -774,12 +833,12 @@ async function setupEditorPage() {
       $saveBtn.addEventListener("click", saveChange);
     }
   } else if (DATA.kind == "View") {
-    $editor.readonly = true;
+    $editor.readOnly = true;
   }
 
   if (!DATA.editable) {
     const $notEditable = document.querySelector(".not-editable");
-    const url = baseUrl();
+    const url = currentUrl();
     const ext = extName(baseName(url));
     if (IFRAME_FORMATS.find(v => v === ext)) {
       $notEditable.insertAdjacentHTML("afterend", `<iframe src="${url}" sandbox width="100%" height="${window.innerHeight - 100}px"></iframe>`);
@@ -792,7 +851,7 @@ async function setupEditorPage() {
 
   $editor.classList.remove("hidden");
   try {
-    const res = await fetch(baseUrl());
+    const res = await fetch(currentUrl());
     await assertResOK(res);
     const encoding = getEncoding(res.headers.get("content-type"));
     if (encoding === "utf-8") {
@@ -816,7 +875,7 @@ async function setupEditorPage() {
 async function deletePath(index) {
   const file = DATA.paths[index];
   if (!file) return;
-  await doDeletePath(file.name, newUrl(file.name), () => {
+  await doDeletePath(file.name, newUrl(file.name, file.directory_password), () => {
     document.getElementById(`addPath${index}`)?.remove();
     DATA.paths[index] = null;
     if (!DATA.paths.find(v => !!v)) {
@@ -837,7 +896,7 @@ async function doDeletePath(name, url, cb) {
     await assertResOK(res);
     cb();
   } catch (err) {
-    alert(`Cannot delete \`${file.name}\`, ${err.message}`);
+    alert(`Cannot delete \`${name}\`, ${err.message}`);
   }
 }
 
@@ -849,10 +908,10 @@ async function doDeletePath(name, url, cb) {
 async function movePath(index) {
   const file = DATA.paths[index];
   if (!file) return;
-  const fileUrl = newUrl(file.name);
+  const fileUrl = newUrl(file.name, file.directory_password);
   const newFileUrl = await doMovePath(fileUrl);
   if (newFileUrl) {
-    location.href = newFileUrl.split("/").slice(0, -1).join("/");
+    location.href = parentUrl(newFileUrl);
   }
 }
 
@@ -867,7 +926,9 @@ async function doMovePath(fileUrl) {
   if (!newPath) return;
   if (!newPath.startsWith("/")) newPath = "/" + newPath;
   if (filePath === newPath) return;
-  const newFileUrl = fileUrlObj.origin + prefix + newPath.split("/").map(encodeURIComponent).join("/");
+  const newFileUrl = withDirectoryPassword(
+    fileUrlObj.origin + prefix + newPath.split("/").map(encodeURIComponent).join("/")
+  );
 
   try {
     await checkAuth();
@@ -898,7 +959,7 @@ async function doMovePath(fileUrl) {
  */
 async function saveChange() {
   try {
-    await fetch(baseUrl(), {
+    await fetch(currentUrl(), {
       method: "PUT",
       body: $editor.value,
     });
@@ -910,8 +971,11 @@ async function saveChange() {
 
 async function checkAuth(variant) {
   if (!DATA.auth) return;
-  const qs = variant ? `?${variant}` : "";
-  const res = await fetch(baseUrl() + qs, {
+  const url = variant === "login"
+    ? new URL(DATA.uri_prefix, location.origin)
+    : new URL(currentUrl());
+  if (variant) url.searchParams.set(variant, "");
+  const res = await fetch(url, {
     method: "CHECKAUTH",
   });
   await assertResOK(res);
@@ -922,7 +986,7 @@ async function checkAuth(variant) {
 
 function logout() {
   if (!DATA.auth) return;
-  const url = baseUrl();
+  const url = currentUrl();
   const xhr = new XMLHttpRequest();
   xhr.open("LOGOUT", url, true, DATA.user);
   xhr.onload = () => {
@@ -943,7 +1007,8 @@ async function createFolder(name) {
       method: "MKCOL",
     });
     await assertResOK(res);
-    location.href = url;
+    const password = res.headers.get("x-dufs-directory-password");
+    location.href = withDirectoryPassword(url, password);
   } catch (err) {
     alert(`Cannot create folder \`${name}\`, ${err.message}`);
   }
@@ -958,7 +1023,7 @@ async function createFile(name) {
       body: "",
     });
     await assertResOK(res);
-    location.href = url + "?edit";
+    location.href = withQuery(url, "edit");
   } catch (err) {
     alert(`Cannot create file \`${name}\`, ${err.message}`);
   }
@@ -986,19 +1051,56 @@ async function addFileEntries(entries, dirs) {
 }
 
 
-function newUrl(name) {
+function newUrl(name, password = DATA?.directory_password) {
   let url = baseUrl();
   if (!url.endsWith("/")) url += "/";
   url += name.split("/").map(encodeURIComponent).join("/");
-  return url;
+  return withDirectoryPassword(url, password);
 }
 
 function baseUrl() {
   return location.href.split(/[?#]/)[0];
 }
 
+function currentUrl() {
+  return withDirectoryPassword(baseUrl());
+}
+
+function withDirectoryPassword(rawUrl, password = DATA?.directory_password) {
+  const url = new URL(rawUrl, location.href);
+  if (password) {
+    url.searchParams.set(DIRECTORY_PASSWORD_QUERY, password);
+  } else {
+    url.searchParams.delete(DIRECTORY_PASSWORD_QUERY);
+  }
+  return url.toString();
+}
+
+function withQuery(rawUrl, name, value = "") {
+  const url = new URL(rawUrl, location.href);
+  url.searchParams.set(name, value);
+  return url.toString();
+}
+
+function parentUrl(rawUrl) {
+  const url = new URL(rawUrl, location.href);
+  url.pathname = url.pathname.split("/").slice(0, -1).join("/") || "/";
+  url.searchParams.delete("edit");
+  url.searchParams.delete("view");
+  return url.toString();
+}
+
+function syncDirectoryPasswordInUrl() {
+  if (!DATA.directory_password) return;
+  const url = new URL(location.href);
+  url.searchParams.set(DIRECTORY_PASSWORD_QUERY, DATA.directory_password);
+  PARAMS = Object.fromEntries(url.searchParams.entries());
+  history.replaceState(null, "", url);
+}
+
 function baseName(url) {
-  return decodeURIComponent(url.split("/").filter(v => v.length > 0).slice(-1)[0]);
+  const pathname = new URL(url, location.href).pathname;
+  return decodeURIComponent(pathname.split("/").filter(v => v.length > 0).slice(-1)[0]);
 }
 
 function extName(filename) {

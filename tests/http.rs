@@ -91,7 +91,7 @@ fn get_dir_noscript(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
         "text/html; charset=utf-8"
     );
     let text = resp.text().unwrap();
-    assert!(text.contains(r#"<td><a href="index.html">index.html</a></td>"#));
+    assert!(text.contains(r#"<td><a href="index.html?edit=">index.html</a></td>"#));
     Ok(())
 }
 

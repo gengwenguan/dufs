@@ -62,9 +62,23 @@ fn render_path_item(path: &PathItem) -> String {
     let mut href = encode_uri(&path.name);
     let mut name = escape_str_pcdata(&path.name).to_string();
     if path.path_type.is_dir() {
-        href.push_str("/?noscript");
+        href.push('/');
         name.push('/');
     };
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    if path.path_type.is_dir() {
+        query.append_pair("noscript", "");
+    } else {
+        query.append_pair("edit", "");
+    }
+    if let Some(password) = &path.directory_password {
+        query.append_pair("dir_password", password);
+    }
+    let query = query.finish();
+    if !query.is_empty() {
+        href.push('?');
+        href.push_str(&query.replace('&', "&amp;"));
+    }
     let mtime = format_mtime(path.mtime).unwrap_or_default();
     let size = format_size(path.size, path.path_type);
 

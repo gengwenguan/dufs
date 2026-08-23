@@ -1,6 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::auth::{www_authenticate, AccessPaths, AccessPerm};
+use crate::directory_auth::{password_matches, DirectoryAuth, DIRECTORY_PASSWORD_QUERY};
 use crate::http_utils::{body_full, IncomingStream, LengthLimitedStream};
 use crate::noscript::{detect_noscript, generate_noscript_html};
 use crate::utils::{
@@ -10,7 +11,10 @@ use crate::Args;
 
 use anyhow::{anyhow, Result};
 use async_deflate_zip::{Compression, WriterOptions, ZipWriter};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use bytes::Bytes;
 use chrono::{LocalResult, TimeZone, Utc};
 use futures_util::{pin_mut, TryStreamExt};
@@ -25,7 +29,7 @@ use hyper::{
     body::Incoming,
     header::{
         HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
-        CONTENT_TYPE, RANGE,
+        CONTENT_TYPE, COOKIE, RANGE, SET_COOKIE,
     },
     Method, StatusCode, Uri,
 };
@@ -66,6 +70,7 @@ const HEALTH_CHECK_PATH: &str = "__dufs__/health";
 const CLIPBOARD_PATH: &str = "__dufs__/clipboard";
 const CLIPBOARD_EVENTS_PATH: &str = "__dufs__/clipboard/events";
 const CLIPBOARD_MAX_SIZE: u64 = 65536; // 64K
+const DIRECTORY_PASSWORD_COOKIE: &str = "dufs_dir_password";
 pub const MAX_SUBPATHS_COUNT: u64 = 1000;
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -93,6 +98,7 @@ impl Default for Clipboard {
 
 pub struct Server {
     args: Args,
+    directory_auth: Option<DirectoryAuth>,
     assets_prefix: String,
     html: Cow<'static, str>,
     single_file_req_paths: Vec<String>,
@@ -102,7 +108,17 @@ pub struct Server {
 
 impl Server {
     pub fn init(args: Args, running: Arc<AtomicBool>) -> Result<Self> {
-        let assets_prefix = format!("__dufs_v{}__/", env!("CARGO_PKG_VERSION"));
+        let directory_auth = args
+            .directory_auth_file
+            .as_ref()
+            .map(|file| DirectoryAuth::load(args.serve_path.clone(), file.clone()))
+            .transpose()?;
+        let assets_revision = assets_revision(args.assets.as_deref())?;
+        let assets_prefix = format!(
+            "__dufs_v{}_{}__/",
+            env!("CARGO_PKG_VERSION"),
+            assets_revision
+        );
         let single_file_req_paths = if args.path_is_file {
             vec![
                 args.uri_prefix.to_string(),
@@ -122,6 +138,7 @@ impl Server {
         };
         Ok(Self {
             args,
+            directory_auth,
             running,
             single_file_req_paths,
             assets_prefix,
@@ -166,6 +183,8 @@ impl Server {
         if enable_cors {
             add_cors(&mut res);
         }
+        res.headers_mut()
+            .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
         Ok(res)
     }
 
@@ -221,16 +240,101 @@ impl Server {
             is_microsoft_webdav,
         );
 
-        let (user, access_paths) = match guard {
-            (None, None) => {
-                self.auth_reject(&mut res)?;
-                return Ok(res);
+        let (user, access_paths) = if let Some(directory_auth) = &self.directory_auth {
+            match guard {
+                (Some(user), Some(access_paths)) => (Some(user), access_paths),
+                (Some(_), None) => {
+                    status_forbid(&mut res);
+                    return Ok(res);
+                }
+                (None, _) if authorization.is_some() => {
+                    self.auth_reject(&mut res)?;
+                    return Ok(res);
+                }
+                (None, _) => {
+                    if method.as_str() == "LOGOUT" {
+                        self.auth_reject(&mut res)?;
+                        return Ok(res);
+                    }
+                    let target = self
+                        .join_path(&relative_path)
+                        .ok_or_else(|| anyhow!("invalid path"))?;
+                    if self.is_directory_auth_metadata(&target).await {
+                        status_not_found(&mut res);
+                        return Ok(res);
+                    }
+                    let password_grant = directory_auth
+                        .grant_for_target(&relative_path, &target)
+                        .await?;
+                    let query_password = query_params.get(DIRECTORY_PASSWORD_QUERY);
+                    let query_granted = password_grant
+                        .as_ref()
+                        .map(|(_, expected)| password_matches(expected, query_password))
+                        .unwrap_or(false);
+                    let mut cookie_granted = false;
+                    if let Some((target_directory, _)) = &password_grant {
+                        for (scope, candidate) in directory_password_cookies(headers) {
+                            let scope_prefix = format!("{scope}/");
+                            if target_directory != &scope
+                                && !target_directory.starts_with(&scope_prefix)
+                            {
+                                continue;
+                            }
+                            if let Some(expected) = directory_auth.registered_password(&scope).await
+                            {
+                                if password_matches(&expected, Some(&candidate)) {
+                                    cookie_granted = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let password_granted = query_granted || cookie_granted;
+
+                    if query_granted && is_directory_share_readonly_method(&method) {
+                        if let Some((directory, password)) = &password_grant {
+                            self.set_directory_password_cookie(directory, password, &mut res)?;
+                        }
+                    }
+
+                    if method.as_str() == "CHECKAUTH" {
+                        if has_query_flag(&query_params, "login") || !password_granted {
+                            self.auth_reject(&mut res)?;
+                        } else {
+                            *res.body_mut() = body_full("");
+                        }
+                        return Ok(res);
+                    }
+                    if method == Method::OPTIONS {
+                        (None, AccessPaths::new(AccessPerm::ReadOnly))
+                    } else if relative_path.is_empty()
+                        && matches!(method, Method::GET | Method::HEAD)
+                    {
+                        (None, AccessPaths::default())
+                    } else if password_granted {
+                        if !is_directory_share_readonly_method(&method) {
+                            status_forbid(&mut res);
+                            return Ok(res);
+                        }
+                        (None, AccessPaths::new(AccessPerm::ReadOnly))
+                    } else {
+                        status_directory_password_required(&mut res);
+                        return Ok(res);
+                    }
+                }
             }
-            (Some(_), None) => {
-                status_forbid(&mut res);
-                return Ok(res);
+        } else {
+            match guard {
+                (None, None) => {
+                    self.auth_reject(&mut res)?;
+                    return Ok(res);
+                }
+                (Some(_), None) => {
+                    status_forbid(&mut res);
+                    return Ok(res);
+                }
+                (x, Some(y)) => (x, y),
             }
-            (x, Some(y)) => (x, y),
         };
 
         if detect_noscript(&user_agent) {
@@ -257,7 +361,12 @@ impl Server {
         }
 
         if has_query_flag(&query_params, "tokengen") {
-            self.handle_tokengen(&relative_path, user, &mut res).await?;
+            if let Some(user) = user {
+                self.handle_tokengen(&relative_path, &user, &mut res)
+                    .await?;
+            } else {
+                status_forbid(&mut res);
+            }
             return Ok(res);
         }
 
@@ -313,6 +422,10 @@ impl Server {
         };
 
         let path = path.as_path();
+        if self.is_directory_auth_metadata(path).await {
+            status_not_found(&mut res);
+            return Ok(res);
+        }
 
         let (is_miss, is_dir, is_file, size) = match fs::metadata(path).await.ok() {
             Some(meta) => (false, meta.is_dir(), meta.is_file(), meta.len()),
@@ -330,6 +443,18 @@ impl Server {
         if self.guard_root_contained(path).await {
             self.handle_not_found(&query_params, headers, head_only, &mut res)
                 .await?;
+            return Ok(res);
+        }
+
+        if method.as_str() == "SETPASSWORD" {
+            if user.is_none() {
+                status_forbid(&mut res);
+            } else if !is_dir {
+                status_not_found(&mut res);
+            } else {
+                self.handle_set_directory_password(path, req, &mut res)
+                    .await?;
+            }
             return Ok(res);
         }
 
@@ -411,11 +536,25 @@ impl Server {
                     if has_query_flag(&query_params, "json") {
                         self.handle_file_json(path, head_only, &mut res).await?;
                     } else if has_query_flag(&query_params, "edit") {
-                        self.handle_edit_file(path, DataKind::Edit, head_only, user, &mut res)
+                        let readwrite = access_paths.perm().readwrite();
+                        let kind = if readwrite {
+                            DataKind::Edit
+                        } else {
+                            DataKind::View
+                        };
+                        self.handle_edit_file(path, kind, head_only, user, readwrite, &mut res)
                             .await?;
                     } else if has_query_flag(&query_params, "view") {
-                        self.handle_edit_file(path, DataKind::View, head_only, user, &mut res)
-                            .await?;
+                        let readwrite = access_paths.perm().readwrite();
+                        self.handle_edit_file(
+                            path,
+                            DataKind::View,
+                            head_only,
+                            user,
+                            readwrite,
+                            &mut res,
+                        )
+                        .await?;
                     } else if has_query_flag(&query_params, "hash") {
                         if self.args.allow_hash {
                             self.handle_hash_file(path, head_only, &mut res).await?;
@@ -577,6 +716,7 @@ impl Server {
         res: &mut Response,
     ) -> Result<()> {
         ensure_path_parent(path).await?;
+        self.ensure_directory_auth_for_parent(path).await?;
         let (mut file, status) = match upload_offset {
             None => (fs::File::create(path).await?, StatusCode::CREATED),
             Some(offset) if offset == size => (
@@ -614,9 +754,15 @@ impl Server {
     }
 
     async fn handle_delete(&self, path: &Path, is_dir: bool, res: &mut Response) -> Result<()> {
+        let relative_path = self.relative_path(path)?;
         match is_dir {
             true => fs::remove_dir_all(path).await?,
             false => fs::remove_file(path).await?,
+        }
+        if is_dir && !relative_path.is_empty() {
+            if let Some(directory_auth) = &self.directory_auth {
+                directory_auth.remove_tree(&relative_path).await?;
+            }
         }
 
         status_no_content(res);
@@ -653,6 +799,7 @@ impl Server {
             access_paths,
             res,
         )
+        .await
     }
 
     async fn handle_search_dir(
@@ -679,6 +826,10 @@ impl Server {
             let path_buf = path.to_path_buf();
             let hidden = Arc::new(self.args.hidden.to_vec());
             let search = search.clone();
+            let excluded_path = self
+                .directory_auth
+                .as_ref()
+                .map(|auth| auth.metadata_path().to_path_buf());
 
             let search_paths = tokio::spawn(collect_dir_entries(
                 access_paths.clone(),
@@ -687,6 +838,7 @@ impl Server {
                 hidden,
                 self.args.allow_symlink,
                 self.args.serve_path.clone(),
+                excluded_path,
                 move |x| get_file_name(x.path()).to_lowercase().contains(&search),
             ))
             .await?;
@@ -707,6 +859,7 @@ impl Server {
             access_paths,
             res,
         )
+        .await
     }
 
     async fn handle_zip_dir(
@@ -730,6 +883,10 @@ impl Server {
         let compression = self.args.compress.to_compression();
         let follow_symlinks = self.args.allow_symlink;
         let serve_path = self.args.serve_path.clone();
+        let excluded_path = self
+            .directory_auth
+            .as_ref()
+            .map(|auth| auth.metadata_path().to_path_buf());
         tokio::spawn(async move {
             if let Err(e) = zip_dir(
                 &mut writer,
@@ -739,6 +896,7 @@ impl Server {
                 compression,
                 follow_symlinks,
                 serve_path,
+                excluded_path,
                 running,
             )
             .await
@@ -1068,6 +1226,7 @@ impl Server {
         kind: DataKind,
         head_only: bool,
         user: Option<String>,
+        readwrite: bool,
         res: &mut Response,
     ) -> Result<()> {
         let (file, meta) = tokio::join!(fs::File::open(path), fs::metadata(path),);
@@ -1080,15 +1239,25 @@ impl Server {
         file.take(1024).read_to_end(&mut buffer).await?;
         let editable =
             meta.len() <= EDITABLE_TEXT_MAX_SIZE && content_inspector::inspect(&buffer).is_text();
+        let directory_password = if let Some(directory_auth) = &self.directory_auth {
+            let relative_path = self.relative_path(path)?;
+            directory_auth
+                .password_for_target(&relative_path, path)
+                .await?
+        } else {
+            None
+        };
         let data = EditData {
             href,
             kind,
             uri_prefix: self.args.uri_prefix.clone(),
-            allow_upload: self.args.allow_upload,
-            allow_delete: self.args.allow_delete,
+            allow_upload: self.args.allow_upload && readwrite,
+            allow_delete: self.args.allow_delete && readwrite,
             auth: self.args.auth.has_users(),
             user,
             editable,
+            directory_auth: self.directory_auth.is_some(),
+            directory_password,
         };
         res.headers_mut()
             .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
@@ -1132,13 +1301,10 @@ impl Server {
     async fn handle_tokengen(
         &self,
         relative_path: &str,
-        user: Option<String>,
+        user: &str,
         res: &mut Response,
     ) -> Result<()> {
-        let output = self
-            .args
-            .auth
-            .generate_token(relative_path, &user.unwrap_or_default())?;
+        let output = self.args.auth.generate_token(relative_path, user)?;
         res.headers_mut()
             .typed_insert(ContentType::from(mime_guess::mime::TEXT_PLAIN_UTF_8));
         res.headers_mut()
@@ -1288,12 +1454,23 @@ impl Server {
 
     async fn handle_mkcol(&self, path: &Path, res: &mut Response) -> Result<()> {
         fs::create_dir_all(path).await?;
+        let relative_path = self.relative_path(path)?;
+        if let Some(directory_auth) = &self.directory_auth {
+            directory_auth.ensure_directory_tree(&relative_path).await?;
+            let password = directory_auth
+                .password_for_directory(&relative_path)
+                .await?;
+            res.headers_mut().insert(
+                "x-dufs-directory-password",
+                HeaderValue::from_str(&password)?,
+            );
+        }
         *res.status_mut() = StatusCode::CREATED;
         Ok(())
     }
 
     async fn handle_copy(&self, path: &Path, req: &Request, res: &mut Response) -> Result<()> {
-        let dest = match self.extract_dest(req, res) {
+        let dest = match self.extract_dest(req, res).await? {
             Some(dest) => dest,
             None => {
                 return Ok(());
@@ -1305,8 +1482,13 @@ impl Server {
             status_forbid(res);
             return Ok(());
         }
+        if self.is_directory_auth_metadata(&dest).await {
+            status_bad_request(res, "Invalid Destination");
+            return Ok(());
+        }
 
         ensure_path_parent(&dest).await?;
+        self.ensure_directory_auth_for_parent(&dest).await?;
 
         if self.guard_root_contained(&dest).await {
             status_bad_request(res, "Invalid Destination");
@@ -1320,14 +1502,22 @@ impl Server {
     }
 
     async fn handle_move(&self, path: &Path, req: &Request, res: &mut Response) -> Result<()> {
-        let dest = match self.extract_dest(req, res) {
+        let dest = match self.extract_dest(req, res).await? {
             Some(dest) => dest,
             None => {
                 return Ok(());
             }
         };
 
+        let is_dir = fs::symlink_metadata(path).await?.is_dir();
+        let source_relative = self.relative_path(path)?;
+        let destination_relative = self.relative_path(&dest)?;
+        if self.is_directory_auth_metadata(&dest).await {
+            status_bad_request(res, "Invalid Destination");
+            return Ok(());
+        }
         ensure_path_parent(&dest).await?;
+        self.ensure_directory_auth_for_parent(&dest).await?;
 
         if self.guard_root_contained(&dest).await {
             status_bad_request(res, "Invalid Destination");
@@ -1335,7 +1525,54 @@ impl Server {
         }
 
         fs::rename(path, &dest).await?;
+        if is_dir {
+            if let Some(directory_auth) = &self.directory_auth {
+                directory_auth
+                    .move_tree(&source_relative, &destination_relative)
+                    .await?;
+                directory_auth
+                    .ensure_directory_tree(&destination_relative)
+                    .await?;
+            }
+        }
 
+        status_no_content(res);
+        Ok(())
+    }
+
+    async fn handle_set_directory_password(
+        &self,
+        path: &Path,
+        req: Request,
+        res: &mut Response,
+    ) -> Result<()> {
+        let Some(directory_auth) = &self.directory_auth else {
+            status_not_found(res);
+            return Ok(());
+        };
+        let body = Limited::new(req.into_body(), 129);
+        let password = match body.collect().await {
+            Ok(collected) => match String::from_utf8(collected.to_bytes().to_vec()) {
+                Ok(password) => password,
+                Err(_) => {
+                    status_bad_request(res, "Directory password must be valid UTF-8");
+                    return Ok(());
+                }
+            },
+            Err(_) => {
+                status_bad_request(res, "Directory password is too long");
+                return Ok(());
+            }
+        };
+        let relative_path = self.relative_path(path)?;
+        if relative_path.is_empty() {
+            status_forbid(res);
+            return Ok(());
+        }
+        if let Err(err) = directory_auth.set_password(&relative_path, &password).await {
+            status_bad_request(res, &err.to_string());
+            return Ok(());
+        }
         status_no_content(res);
         Ok(())
     }
@@ -1380,7 +1617,7 @@ impl Server {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn send_index(
+    async fn send_index(
         &self,
         path: &Path,
         mut paths: Vec<PathItem>,
@@ -1415,9 +1652,9 @@ impl Server {
                 .map(|v| {
                     let displayname = escape_str_pcdata(&v.name);
                     if v.is_dir() {
-                        format!("{}/\n", displayname)
+                        format!("{displayname}/\n")
                     } else {
-                        format!("{}\n", displayname)
+                        format!("{displayname}\n")
                     }
                 })
                 .collect::<Vec<String>>()
@@ -1437,6 +1674,7 @@ impl Server {
             normalize_path(path.strip_prefix(&self.args.serve_path)?)
         );
         let readwrite = access_paths.perm().readwrite();
+        let directory_password = self.directory_password_for_path(path).await?;
         let data = IndexData {
             kind: DataKind::Index,
             href,
@@ -1448,6 +1686,8 @@ impl Server {
             dir_exists: exist,
             auth: self.args.auth.has_users(),
             user,
+            directory_auth: self.directory_auth.is_some(),
+            directory_password,
             paths,
         };
         let output = if has_query_flag(query_params, "json") {
@@ -1515,18 +1755,108 @@ impl Server {
             .unwrap_or_default()
     }
 
-    fn extract_dest(&self, req: &Request, res: &mut Response) -> Option<PathBuf> {
+    async fn is_directory_auth_metadata(&self, path: &Path) -> bool {
+        let Some(directory_auth) = &self.directory_auth else {
+            return false;
+        };
+        let metadata_path = directory_auth.metadata_path();
+        if path == metadata_path {
+            return true;
+        }
+        if let (Ok(path), Ok(metadata_path)) = (
+            fs::canonicalize(path).await,
+            fs::canonicalize(metadata_path).await,
+        ) {
+            if path == metadata_path {
+                return true;
+            }
+        }
+        let Some(parent) = metadata_path.parent() else {
+            return false;
+        };
+        let Some(filename) = metadata_path.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        path.parent() == Some(parent)
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with(&format!("{filename}.tmp-")))
+                .unwrap_or(false)
+    }
+
+    async fn directory_password_for_path(&self, path: &Path) -> Result<Option<String>> {
+        let Some(directory_auth) = &self.directory_auth else {
+            return Ok(None);
+        };
+        let relative_path = normalize_path(path.strip_prefix(&self.args.serve_path)?);
+        if relative_path.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            directory_auth
+                .password_for_directory(&relative_path)
+                .await?,
+        ))
+    }
+
+    fn set_directory_password_cookie(
+        &self,
+        directory: &str,
+        password: &str,
+        res: &mut Response,
+    ) -> Result<()> {
+        let mut path = format!("{}{}", self.args.uri_prefix, encode_uri(directory));
+        if !path.ends_with('/') {
+            path.push('/');
+        }
+        let payload = URL_SAFE_NO_PAD.encode(format!("{directory}\0{password}"));
+        let value =
+            format!("{DIRECTORY_PASSWORD_COOKIE}={payload}; Path={path}; HttpOnly; SameSite=Lax");
+        res.headers_mut()
+            .append(SET_COOKIE, HeaderValue::from_str(&value)?);
+        Ok(())
+    }
+
+    fn relative_path(&self, path: &Path) -> Result<String> {
+        Ok(normalize_path(path.strip_prefix(&self.args.serve_path)?))
+    }
+
+    async fn ensure_directory_auth_for_parent(&self, path: &Path) -> Result<()> {
+        let Some(directory_auth) = &self.directory_auth else {
+            return Ok(());
+        };
+        let Some(parent) = path.parent() else {
+            return Ok(());
+        };
+        let relative_path = self.relative_path(parent)?;
+        if !relative_path.is_empty() {
+            directory_auth.ensure_directory_tree(&relative_path).await?;
+        }
+        Ok(())
+    }
+
+    async fn extract_dest(&self, req: &Request, res: &mut Response) -> Result<Option<PathBuf>> {
         let headers = req.headers();
-        let dest_path = match self
-            .extract_destination_header(headers)
-            .and_then(|dest| self.resolve_path(&dest))
-        {
+        let destination = match self.extract_destination_header(headers) {
+            Some(destination) => destination,
+            None => {
+                status_bad_request(res, "Invalid Destination");
+                return Ok(None);
+            }
+        };
+        let dest_path = match self.resolve_path(destination.path()) {
             Some(dest) => dest,
             None => {
                 status_bad_request(res, "Invalid Destination");
-                return None;
+                return Ok(None);
             }
         };
+        let destination_password = destination.query().and_then(|query| {
+            form_urlencoded::parse(query.as_bytes())
+                .find(|(key, _)| key == DIRECTORY_PASSWORD_QUERY)
+                .map(|(_, value)| value.to_string())
+        });
 
         let authorization = headers.get(AUTHORIZATION);
         let guard = self
@@ -1534,29 +1864,42 @@ impl Server {
             .auth
             .guard(&dest_path, req.method(), authorization, None, false);
 
-        match guard {
-            (_, Some(_)) => {}
-            _ => {
-                status_forbid(res);
-                return None;
-            }
-        };
-
         let dest = match self.join_path(&dest_path) {
             Some(dest) => dest,
             None => {
                 *res.status_mut() = StatusCode::BAD_REQUEST;
-                return None;
+                return Ok(None);
             }
         };
 
-        Some(dest)
+        let granted = if let Some(directory_auth) = &self.directory_auth {
+            match guard {
+                (Some(_), Some(_)) => true,
+                (None, _) if authorization.is_none() => {
+                    let expected = directory_auth
+                        .password_for_target(&dest_path, &dest)
+                        .await?;
+                    expected
+                        .as_deref()
+                        .map(|expected| password_matches(expected, destination_password.as_ref()))
+                        .unwrap_or(false)
+                }
+                _ => false,
+            }
+        } else {
+            guard.1.is_some()
+        };
+        if !granted {
+            status_forbid(res);
+            return Ok(None);
+        }
+
+        Ok(Some(dest))
     }
 
-    fn extract_destination_header(&self, headers: &HeaderMap<HeaderValue>) -> Option<String> {
+    fn extract_destination_header(&self, headers: &HeaderMap<HeaderValue>) -> Option<Uri> {
         let dest = headers.get("Destination")?.to_str().ok()?;
-        let uri: Uri = dest.parse().ok()?;
-        Some(uri.path().to_string())
+        dest.parse().ok()
     }
 
     fn resolve_path(&self, path: &str) -> Option<String> {
@@ -1622,6 +1965,9 @@ impl Server {
     }
 
     async fn add_pathitem(&self, paths: &mut Vec<PathItem>, base_path: &Path, entry_path: &Path) {
+        if self.is_directory_auth_metadata(entry_path).await {
+            return;
+        }
         let base_name = get_file_name(entry_path);
         if let Ok(Some(item)) = self.to_pathitem(entry_path, base_path).await {
             if is_hidden(&self.args.hidden, base_name, item.is_dir()) {
@@ -1676,11 +2022,20 @@ impl Server {
         };
         let rel_path = path.strip_prefix(base_path)?;
         let name = normalize_path(rel_path);
+        let directory_password = if let Some(directory_auth) = &self.directory_auth {
+            let relative_path = normalize_path(path.strip_prefix(&self.args.serve_path)?);
+            directory_auth
+                .password_for_target(&relative_path, path)
+                .await?
+        } else {
+            None
+        };
         Ok(Some(PathItem {
             path_type,
             name,
             mtime,
             size,
+            directory_password,
         }))
     }
 }
@@ -1704,6 +2059,8 @@ pub struct IndexData {
     pub dir_exists: bool,
     pub auth: bool,
     pub user: Option<String>,
+    pub directory_auth: bool,
+    pub directory_password: Option<String>,
     pub paths: Vec<PathItem>,
 }
 
@@ -1713,6 +2070,7 @@ pub struct PathItem {
     pub name: String,
     pub mtime: u64,
     pub size: u64,
+    pub directory_password: Option<String>,
 }
 
 impl PathItem {
@@ -1832,6 +2190,8 @@ struct EditData {
     auth: bool,
     user: Option<String>,
     editable: bool,
+    directory_auth: bool,
+    directory_password: Option<String>,
 }
 
 fn to_timestamp(time: &SystemTime) -> u64 {
@@ -1847,6 +2207,42 @@ fn normalize_path<P: AsRef<Path>>(path: P) -> String {
     } else {
         path.to_string()
     }
+}
+
+fn assets_revision(assets_path: Option<&Path>) -> Result<String> {
+    let mut hasher = Sha256::new();
+    match assets_path {
+        Some(path) => {
+            for name in ["index.html", "index.js", "index.css", "favicon.ico"] {
+                hasher.update(name.as_bytes());
+                match std::fs::read(path.join(name)) {
+                    Ok(content) => {
+                        hasher.update([1]);
+                        hasher.update((content.len() as u64).to_be_bytes());
+                        hasher.update(content);
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        hasher.update([0]);
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        }
+        None => {
+            for (name, content) in [
+                ("index.html", INDEX_HTML.as_bytes()),
+                ("index.js", INDEX_JS.as_bytes()),
+                ("index.css", INDEX_CSS.as_bytes()),
+                ("favicon.ico", FAVICON_ICO),
+            ] {
+                hasher.update(name.as_bytes());
+                hasher.update([1]);
+                hasher.update((content.len() as u64).to_be_bytes());
+                hasher.update(content);
+            }
+        }
+    }
+    Ok(hex::encode(&hasher.finalize()[..8]))
 }
 
 async fn ensure_path_parent(path: &Path) -> Result<()> {
@@ -1899,6 +2295,7 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
     compression: Compression,
     follow_symlinks: bool,
     serve_path: PathBuf,
+    excluded_path: Option<PathBuf>,
     running: Arc<AtomicBool>,
 ) -> Result<()> {
     let hidden = Arc::new(hidden.to_vec());
@@ -1909,6 +2306,7 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
         hidden,
         follow_symlinks,
         serve_path,
+        excluded_path,
         move |x| x.path().symlink_metadata().is_ok() && x.file_type().is_file(),
     ))
     .await?;
@@ -1945,6 +2343,15 @@ fn extract_cache_headers(meta: &Metadata) -> Option<(ETag, LastModified)> {
 fn status_forbid(res: &mut Response) {
     *res.status_mut() = StatusCode::FORBIDDEN;
     *res.body_mut() = body_full("Forbidden");
+}
+
+fn status_directory_password_required(res: &mut Response) {
+    *res.status_mut() = StatusCode::UNAUTHORIZED;
+    res.headers_mut().insert(
+        "x-dufs-directory-password",
+        HeaderValue::from_static("required"),
+    );
+    *res.body_mut() = body_full("Directory password required");
 }
 
 fn status_not_found(res: &mut Response) {
@@ -2077,6 +2484,27 @@ fn has_query_flag(query_params: &HashMap<String, String>, name: &str) -> bool {
         .unwrap_or_default()
 }
 
+fn directory_password_cookies(headers: &HeaderMap<HeaderValue>) -> Vec<(String, String)> {
+    headers
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|header| header.to_str().ok())
+        .flat_map(|header| header.split(';'))
+        .filter_map(|item| item.trim().split_once('='))
+        .filter(|(name, _)| *name == DIRECTORY_PASSWORD_COOKIE)
+        .filter_map(|(_, value)| URL_SAFE_NO_PAD.decode(value).ok())
+        .filter_map(|value| String::from_utf8(value).ok())
+        .filter_map(|value| {
+            let (scope, password) = value.split_once('\0')?;
+            Some((scope.to_string(), password.to_string()))
+        })
+        .collect()
+}
+
+fn is_directory_share_readonly_method(method: &Method) -> bool {
+    matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) || method.as_str() == "PROPFIND"
+}
+
 async fn collect_dir_entries<F>(
     access_paths: AccessPaths,
     running: Arc<AtomicBool>,
@@ -2084,12 +2512,17 @@ async fn collect_dir_entries<F>(
     hidden: Arc<Vec<String>>,
     follow_symlinks: bool,
     serve_path: PathBuf,
+    excluded_path: Option<PathBuf>,
     include_entry: F,
 ) -> Vec<PathBuf>
 where
     F: Fn(&DirEntry) -> bool,
 {
     let mut paths: Vec<PathBuf> = vec![];
+    let excluded_path = match excluded_path {
+        Some(path) => fs::canonicalize(path).await.ok(),
+        None => None,
+    };
     for dir in access_paths.entry_paths(&path) {
         let mut it = WalkDir::new(&dir).follow_links(true).into_iter();
         it.next();
@@ -2111,10 +2544,25 @@ where
                 continue;
             }
 
+            let canonical_path = if excluded_path.is_some() || !follow_symlinks {
+                fs::canonicalize(entry_path).await.ok()
+            } else {
+                None
+            };
+            if canonical_path
+                .as_ref()
+                .zip(excluded_path.as_ref())
+                .map(|(path, excluded)| is_excluded_path(path, excluded))
+                .unwrap_or(false)
+            {
+                if is_dir {
+                    it.skip_current_dir();
+                }
+                continue;
+            }
+
             if !follow_symlinks
-                && !fs::canonicalize(entry_path)
-                    .await
-                    .ok()
+                && !canonical_path
                     .map(|v| v.starts_with(&serve_path))
                     .unwrap_or_default()
             {
@@ -2133,4 +2581,38 @@ where
         }
     }
     paths
+}
+
+fn is_excluded_path(path: &Path, excluded: &Path) -> bool {
+    if path == excluded {
+        return true;
+    }
+    let Some(excluded_name) = excluded.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    path.parent() == excluded.parent()
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.starts_with(&format!("{excluded_name}.tmp-")))
+            .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assert_fs::prelude::*;
+
+    #[test]
+    fn assets_revision_changes_with_content() {
+        let assets = assert_fs::TempDir::new().unwrap();
+        assets.child("index.html").write_str("index").unwrap();
+        assets.child("index.js").write_str("old").unwrap();
+        let old_revision = assets_revision(Some(assets.path())).unwrap();
+
+        assets.child("index.js").write_str("new").unwrap();
+        let new_revision = assets_revision(Some(assets.path())).unwrap();
+
+        assert_ne!(old_revision, new_revision);
+    }
 }

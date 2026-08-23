@@ -61,6 +61,8 @@ Options:
       --path-prefix <path>   Specify a path prefix
       --hidden <value>       Hide paths from directory listings, e.g. tmp,*.log,*.lock
   -a, --auth <rules>         Add auth roles, e.g. user:pass@/dir1:rw,/dir2
+      --directory-auth       Protect each directory with an independent URL password
+      --directory-auth-file  Store directory URL passwords in this file
   -A, --allow-all            Allow all operations
       --allow-upload         Allow upload files/folders
       --allow-delete         Allow delete files/folders
@@ -270,6 +272,34 @@ Two important things for hashed passwords:
 1. Dufs only supports sha-512 hashed passwords, so ensure that the password string always starts with `$6$`.
 2. Digest authentication does not function properly with hashed passwords.
 
+### Directory URL Passwords
+
+Use `--directory-auth` to give every directory an independent password carried
+by the `dir_password` URL query parameter.
+
+```sh
+dufs /data -A --directory-auth -a 'admin:change-me@/:rw'
+```
+
+- Anonymous users only see a blank root page. A correct `dir_password` grants
+  read-only access to browse, preview, search, and download that directory;
+  uploads, edits, renames, deletions, and other write operations are rejected.
+- New directories receive a random 128-bit password. Child directories have
+  different passwords, and links generated in an authorized parent directory
+  include the correct child password.
+- An authenticated account keeps its configured path permissions, can access
+  directories without a URL password, and can change a directory password from
+  the web UI. The UI adds the current directory password to the URL.
+- Passwords are stored in `.dufs-directory-auth.json` by default. Use
+  `--directory-auth-file` to place this file outside the served directory.
+
+Directory URL passwords are bearer capabilities: anyone who receives a URL can
+use it. Query values can remain in browser history and copied links. Dufs
+redacts `dir_password` from access logs and sends a `no-referrer` policy, but
+you should still use HTTPS. The password store contains recoverable plaintext
+because authenticated users can ask the UI to add directory passwords to URLs;
+protect it with filesystem permissions and backups.
+
 
 ### Hide Paths
 
@@ -348,6 +378,8 @@ All options can be set using environment variables prefixed with `DUFS_`.
     --path-prefix <path>    DUFS_PATH_PREFIX=/dufs
     --hidden <value>        DUFS_HIDDEN=tmp,*.log,*.lock
 -a, --auth <rules>          DUFS_AUTH="admin:admin@/:rw|@/" 
+    --directory-auth        DUFS_DIRECTORY_AUTH=true
+    --directory-auth-file   DUFS_DIRECTORY_AUTH_FILE=/var/lib/dufs/directory-auth.json
 -A, --allow-all             DUFS_ALLOW_ALL=true
     --allow-upload          DUFS_ALLOW_UPLOAD=true
     --allow-delete          DUFS_ALLOW_DELETE=true
@@ -386,6 +418,8 @@ auth:
   - admin:admin@/:rw
   - user:pass@/src:rw,/share
   - '@/'  # According to the YAML spec, quoting is required.
+directory-auth: false
+directory-auth-file: /var/lib/dufs/directory-auth.json
 allow-all: false
 allow-upload: true
 allow-delete: true

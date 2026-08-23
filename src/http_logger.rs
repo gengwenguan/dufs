@@ -6,6 +6,7 @@ use std::{
 
 use chrono::{Local, SecondsFormat};
 
+use crate::directory_auth::DIRECTORY_PASSWORD_QUERY;
 use crate::{auth::get_auth_user, server::Request, utils::decode_uri};
 
 pub const DEFAULT_LOG_FORMAT: &str =
@@ -36,7 +37,7 @@ impl HttpLogger {
             match element {
                 LogElement::Variable(name) => match name.as_str() {
                     "request" | "request_method" | "request_uri" => {
-                        let uri = req.uri().to_string();
+                        let uri = redact_sensitive_query(&req.uri().to_string());
                         let decoded_uri = decode_uri(&uri)
                             .map(|s| sanitize_log_value(&s))
                             .unwrap_or_else(|| uri.clone());
@@ -58,7 +59,10 @@ impl HttpLogger {
                 },
                 LogElement::Header(name) => {
                     if let Some(value) = req.headers().get(name).and_then(|v| v.to_str().ok()) {
-                        data.insert(name.to_string(), sanitize_log_value(value));
+                        data.insert(
+                            name.to_string(),
+                            sanitize_log_value(&redact_sensitive_query(value)),
+                        );
                     }
                 }
                 LogElement::Literal(_) => {}
@@ -120,7 +124,7 @@ fn emit_http_access(msg: &str, is_error: bool) {
     };
     log::logger().log(
         &log::Record::builder()
-            .args(format_args!("{}", msg))
+            .args(format_args!("{msg}"))
             .level(level)
             .target("http_access")
             .build(),
@@ -168,4 +172,39 @@ fn sanitize_log_value(s: &str) -> String {
             c => vec![c],
         })
         .collect()
+}
+
+fn redact_sensitive_query(value: &str) -> String {
+    let Some((base, query_and_fragment)) = value.split_once('?') else {
+        return value.to_string();
+    };
+    let (query, fragment) = query_and_fragment
+        .split_once('#')
+        .map(|(query, fragment)| (query, Some(fragment)))
+        .unwrap_or((query_and_fragment, None));
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+        if key == DIRECTORY_PASSWORD_QUERY {
+            serializer.append_pair(&key, "[REDACTED]");
+        } else {
+            serializer.append_pair(&key, &value);
+        }
+    }
+    let query = serializer.finish();
+    match fragment {
+        Some(fragment) => format!("{base}?{query}#{fragment}"),
+        None => format!("{base}?{query}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_directory_password() {
+        let value = redact_sensitive_query("/share?dir_password=secret&q=test");
+        assert_eq!(value, "/share?dir_password=%5BREDACTED%5D&q=test");
+        assert!(!value.contains("secret"));
+    }
 }

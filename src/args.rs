@@ -100,6 +100,23 @@ pub fn build_cli() -> Command {
                 .value_name("value"),
         )
         .arg(
+            Arg::new("directory-auth")
+                .env("DUFS_DIRECTORY_AUTH")
+                .hide_env(true)
+                .long("directory-auth")
+                .action(ArgAction::SetTrue)
+                .help("Protect each directory with an independent URL password"),
+        )
+        .arg(
+            Arg::new("directory-auth-file")
+                .env("DUFS_DIRECTORY_AUTH_FILE")
+                .hide_env(true)
+                .long("directory-auth-file")
+                .value_parser(value_parser!(PathBuf))
+                .value_name("file")
+                .help("Store directory URL passwords in this file"),
+        )
+        .arg(
             Arg::new("allow-all")
                 .env("DUFS_ALLOW_ALL")
 				.hide_env(true)
@@ -283,6 +300,8 @@ pub struct Args {
     pub hidden: Vec<String>,
     #[serde(deserialize_with = "deserialize_access_control")]
     pub auth: AccessControl,
+    pub directory_auth: bool,
+    pub directory_auth_file: Option<PathBuf>,
     pub allow_all: bool,
     pub allow_upload: bool,
     pub allow_delete: bool,
@@ -365,6 +384,34 @@ impl Args {
         if let Some(rules) = matches.get_many::<String>("auth") {
             let rules: Vec<_> = rules.map(|v| v.as_str()).collect();
             args.auth = AccessControl::new(&rules)?;
+        }
+
+        if !args.directory_auth {
+            args.directory_auth = matches.get_flag("directory-auth");
+        }
+        if let Some(path) = matches.get_one::<PathBuf>("directory-auth-file") {
+            args.directory_auth_file = Some(path.clone());
+        }
+        if args.directory_auth {
+            if args.path_is_file {
+                bail!("Directory auth cannot be used when serving a single file");
+            }
+            if !args.auth.has_users() {
+                bail!("Directory auth requires at least one account configured with --auth");
+            }
+            let path = args
+                .directory_auth_file
+                .take()
+                .unwrap_or_else(|| args.serve_path.join(".dufs-directory-auth.json"));
+            let path = Self::sanitize_new_file_path(path)?;
+            if path.parent() == Some(args.serve_path.as_path()) {
+                if let Some(filename) = path.file_name().and_then(|name| name.to_str()) {
+                    args.hidden.push(format!("{filename}*"));
+                }
+            }
+            args.directory_auth_file = Some(path);
+        } else {
+            args.directory_auth_file = None;
         }
 
         if !args.allow_all {
@@ -476,6 +523,24 @@ impl Args {
             bail!("Path `{}` doesn't contains index.html", path.display());
         }
         Ok(path)
+    }
+
+    fn sanitize_new_file_path<P: AsRef<Path>>(path: P) -> Result<PathBuf> {
+        let path = path.as_ref();
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            env::current_dir()?.join(path)
+        };
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Invalid file path `{}`", path.display()))?;
+        let parent = std::fs::canonicalize(parent)
+            .with_context(|| format!("Failed to access path `{}`", parent.display()))?;
+        let filename = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("Invalid file path `{}`", path.display()))?;
+        Ok(parent.join(filename))
     }
 }
 
